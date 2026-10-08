@@ -146,12 +146,25 @@ crictl pull registry.k8s.io/kube-proxy:v1.28.4
 docker  pull nginx:1.21
 ```
 
+## 🛡️ 安全运维：预览访问与运行时预算
+
+本项目是只读镜像拉取代理。以下设置是安全边界的一部分，后续部署和故障回退都必须保留：
+
+- **保持 Pages `Restrict previews`（`Enable access policy`）开启。** 项目 `cf-workers-docker-io` 的 Access 域名范围为 `*.cf-workers-docker-io-4gy.pages.dev`，保护 hash 固定部署 URL 和分支预览 URL。旧部署仍运行各自的历史代码；仅更新生产别名不能阻止从历史 URL 绕过上游白名单等修复。使用受限成员策略，不要添加公共 `Bypass` 或为了调试关闭保护。
+- 公开拉取入口仍为 `docker.funcd.org` 和 `cf-workers-docker-io-4gy.pages.dev`。发布时先验证固定/预览 URL 对未登录请求返回 Access 登录跳转，再验证两个公开入口的 `/v2/` 返回正常 registry `401` challenge；不要把公开入口纳入要求交互登录的 Access 通配范围。
+- **禁止回滚到易受攻击的历史版本。** 保存部署回执用于审计；需要回退时，只选择包含代理安全修复的版本或从已修复源码重新部署。不能将旧开放代理重新指向生产别名，也不能关闭 Access 来使用旧版本。
+- **保留项目管理的 CPU 上限：production 和 preview 均为 `limits.cpu_ms = 1000`。** 这是每次调用的 CPU 时间上限，不是下载墙钟时间或总账单上限。设置由 Pages 项目管理；每次部署后核对准确提交的部署回执及生成运行时的 `limits.cpu_ms`，不能仅凭项目配置已保存就认定旧部署已应用新上限。
+- Worker 的 300 请求/IP/分钟限制只在单个 isolate 内生效，最多保留 4096 个 IP 记录；它不能保证全局调用或账单硬上限。Docker Hub 返回源站 `429` 时应如实传递，不能增加自动重试或任意上游回退来绕过额度。共享匿名出口额度耗尽时，不能把成功的 blob/HEAD/Range 测试宣称为完整 manifest 拉取通过。
+- 保持仓库的 `Upstream Sync` workflow 停用；任何上游同步都必须先审查其是否保留这些代理保护和运维约束。
+
+参考：[Pages 预览访问控制](https://developers.cloudflare.com/pages/configuration/preview-deployments/#customize-preview-deployments-access)、[Pages Functions limits](https://developers.cloudflare.com/pages/functions/wrangler-configuration/#limits)。
+
 ## 🔧 变量说明
 
 | 变量名 | 示例 | 必填 | 备注 |
 |--|--|--|--|
 | URL302 | `https://t.me/CMLiussss` |❌| 主页302跳转 |
-| URL | `https://www.baidu.com/` |❌| 主页伪装(设为`nginx`则伪装为nginx默认页面) |
+| URL | `nginx` |❌| 本地 nginx 主页；远程主页代理已禁用 |
 | UA | `netcraft` |❌| 支持多元素, 元素之间使用空格或换行作间隔 |
 
 # 🛠️ 第三方 DockerHub 镜像服务
