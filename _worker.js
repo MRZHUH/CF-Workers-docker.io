@@ -1,67 +1,122 @@
-// _worker.js
+// Docker pull mirror: all routing decisions and upstream budgets are per request.
+const DEFAULT_REGISTRY = 'registry-1.docker.io';
+const AUTH_ORIGIN = 'https://auth.docker.io';
+const ROUTES = Object.freeze({
+    quay: 'quay.io', gcr: 'gcr.io', 'k8s-gcr': 'k8s.gcr.io',
+    k8s: 'registry.k8s.io', ghcr: 'ghcr.io',
+    cloudsmith: 'docker.cloudsmith.io', nvcr: 'nvcr.io', test: DEFAULT_REGISTRY,
+});
+const REGISTRIES = new Set([DEFAULT_REGISTRY, ...Object.values(ROUTES)]);
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 4;
+const MAX_URL_LENGTH = 8192;
+const WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_IP = 300;
+const MAX_IPS = 4096;
+// Best-effort abuse brake only: isolate memory is neither a global quota nor a cost cap.
+const clients = new Map();
+let lastCleanup = 0;
 
-// Docker镜像仓库主机地址
-let hub_host = 'registry-1.docker.io';
-// Docker认证服务器地址
-const auth_url = 'https://auth.docker.io';
-
-let 屏蔽爬虫UA = ['netcraft'];
-
-// 根据主机名选择对应的上游地址
-function routeByHosts(host) {
-	// 定义路由表
-	const routes = {
-		// 生产环境
-		"quay": "quay.io",
-		"gcr": "gcr.io",
-		"k8s-gcr": "k8s.gcr.io",
-		"k8s": "registry.k8s.io",
-		"ghcr": "ghcr.io",
-		"cloudsmith": "docker.cloudsmith.io",
-		"nvcr": "nvcr.io",
-
-		// 测试环境
-		"test": "registry-1.docker.io",
-	};
-
-	if (host in routes) return [routes[host], false];
-	else return [hub_host, true];
+function admit(request) {
+    const now = Date.now();
+    if (now - lastCleanup >= WINDOW_MS) {
+        for (const [ip, state] of clients) {
+            if (now - state.start >= WINDOW_MS) clients.delete(ip);
+        }
+        lastCleanup = now;
+    }
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    let state = clients.get(ip);
+    if (!state || now - state.start >= WINDOW_MS) {
+        if (!state && clients.size >= MAX_IPS) return false;
+        state = { start: now, count: 0 };
+        clients.set(ip, state);
+    }
+    return ++state.count <= MAX_REQUESTS_PER_IP;
 }
 
-/** @type {RequestInit} */
-const PREFLIGHT_INIT = {
-	// 预检请求配置
-	headers: new Headers({
-		'access-control-allow-origin': '*', // 允许所有来源
-		'access-control-allow-methods': 'GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS', // 允许的HTTP方法
-		'access-control-max-age': '1728000', // 预检请求的缓存时间
-	}),
+function reject(message, status, headers = {}) {
+    return new Response(message, { status, headers: { 'Cache-Control': 'no-store', ...headers } });
 }
 
-/**
- * 构造响应
- * @param {any} body 响应体
- * @param {number} status 响应状态码
- * @param {Object<string, string>} headers 响应头
- */
-function makeRes(body, status = 200, headers = {}) {
-	headers['access-control-allow-origin'] = '*' // 允许所有来源
-	return new Response(body, { status, headers }) // 返回新构造的响应
+function registryFor(url) {
+    if (url.searchParams.getAll('ns').length > 1 || url.searchParams.getAll('hubhost').length > 1) return null;
+    const ns = url.searchParams.get('ns');
+    const hubhost = url.searchParams.get('hubhost');
+    if (ns !== null) {
+        const registry = ns === 'docker.io' ? DEFAULT_REGISTRY : ns;
+        if (!REGISTRIES.has(registry)) return null;
+        // Do not let a second routing parameter conceal an invalid value.
+        if (hubhost !== null && !REGISTRIES.has(hubhost) && !Object.hasOwn(ROUTES, hubhost)) return null;
+        return registry;
+    }
+    if (hubhost !== null) {
+        if (hubhost === 'docker.io') return DEFAULT_REGISTRY;
+        if (REGISTRIES.has(hubhost)) return hubhost;
+        return Object.hasOwn(ROUTES, hubhost) ? ROUTES[hubhost] : null;
+    }
+    const prefix = url.hostname.split('.')[0];
+    return Object.hasOwn(ROUTES, prefix) ? ROUTES[prefix] : DEFAULT_REGISTRY;
 }
 
-/**
- * 构造新的URL对象
- * @param {string} urlStr URL字符串
- * @param {string} base URL base
- */
-function newUrl(urlStr, base) {
-	try {
-		console.log(`Constructing new URL object with path ${urlStr} and base ${base}`);
-		return new URL(urlStr, base); // 尝试构造新的URL对象
-	} catch (err) {
-		console.error(err);
-		return null // 构造失败返回null
-	}
+function allowedTarget(url, originHost, registry) {
+    if (url.protocol !== 'https:' || url.port || url.username || url.password || url.hostname === originHost) return false;
+    if (url.hostname === registry) return true;
+    // CDN destinations are reached only through a validated registry response, never client input.
+    const host = url.hostname;
+    if (registry === DEFAULT_REGISTRY) {
+        return host === 'production.cloudflare.docker.com' || host === 'production.cloudfront.docker.com';
+    }
+    if (['gcr.io', 'k8s.gcr.io', 'registry.k8s.io'].includes(registry)) {
+        return host === 'registry.k8s.io' || host === 'gcr.io' || host === 'k8s.gcr.io' ||
+            host === 'storage.googleapis.com' || /^[a-z0-9-]+-docker\.pkg\.dev$/.test(host);
+    }
+    if (registry === 'ghcr.io') return host === 'pkg-containers.githubusercontent.com';
+    if (registry === 'quay.io') return /^[a-z0-9-]+\.quay\.io$/.test(host);
+    return false;
+}
+
+function upstreamHeaders(request) {
+    const headers = new Headers();
+    for (const name of ['User-Agent', 'Accept', 'Accept-Language', 'Accept-Encoding',
+        'Authorization', 'Range', 'If-Range', 'If-None-Match', 'If-Modified-Since']) {
+        if (request.headers.has(name)) headers.set(name, request.headers.get(name));
+    }
+    headers.set('X-Docker-Proxy-Hop', '1');
+    return headers;
+}
+
+async function upstream(request, target, registry, originHost) {
+    const headers = upstreamHeaders(request);
+    const visited = new Set();
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+        if (target.href.length > MAX_URL_LENGTH || !allowedTarget(target, originHost, registry) || visited.has(target.href)) {
+            return reject('Unsafe upstream redirect', 502);
+        }
+        visited.add(target.href);
+        let response;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15_000);
+        try {
+            // Timeout applies to connection/response headers. Blob bodies stay streaming.
+            response = await fetch(target, {
+                method: request.method, headers, redirect: 'manual',
+                signal: controller.signal,
+            });
+        } catch {
+            return reject('Upstream unavailable', 502);
+        } finally {
+            clearTimeout(timeout);
+        }
+        const location = response.headers.get('Location');
+        if (!REDIRECT_STATUSES.has(response.status) || !location) return response;
+        await response.body?.cancel();
+        if (hop === MAX_REDIRECTS) return reject('Upstream redirect limit exceeded', 502);
+        let next;
+        try { next = new URL(location, target); } catch { return reject('Invalid upstream redirect', 502); }
+        if (next.origin !== target.origin) headers.delete('Authorization');
+        target = next;
+    }
 }
 
 async function nginx() {
@@ -412,318 +467,77 @@ async function searchInterface() {
 }
 
 export default {
-	async fetch(request, env, ctx) {
-		const getReqHeader = (key) => request.headers.get(key); // 获取请求头
-
-		let url = new URL(request.url); // 解析请求URL
-		const userAgentHeader = request.headers.get('User-Agent');
-		const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
-		if (env.UA) 屏蔽爬虫UA = 屏蔽爬虫UA.concat(await ADD(env.UA));
-		const workers_url = `https://${url.hostname}`;
-
-		// 获取请求参数中的 ns
-		const ns = url.searchParams.get('ns');
-		const hostname = url.searchParams.get('hubhost') || url.hostname;
-		const hostTop = hostname.split('.')[0]; // 获取主机名的第一部分
-
-		let checkHost; // 在这里定义 checkHost 变量
-		// 如果存在 ns 参数，优先使用它来确定 hub_host
-		if (ns) {
-			if (ns === 'docker.io') {
-				hub_host = 'registry-1.docker.io'; // 设置上游地址为 registry-1.docker.io
-			} else {
-				hub_host = ns; // 直接使用 ns 作为 hub_host
-			}
-		} else {
-			checkHost = routeByHosts(hostTop);
-			hub_host = checkHost[0]; // 获取上游地址
-		}
-
-		const fakePage = checkHost ? checkHost[1] : false; // 确保 fakePage 不为 undefined
-		console.log(`域名头部: ${hostTop} 反代地址: ${hub_host} searchInterface: ${fakePage}`);
-		// 更改请求的主机名
-		url.hostname = hub_host;
-		const hubParams = ['/v1/search', '/v1/repositories'];
-		if (屏蔽爬虫UA.some(fxxk => userAgent.includes(fxxk)) && 屏蔽爬虫UA.length > 0) {
-			// 首页改成一个nginx伪装页
-			return new Response(await nginx(), {
-				headers: {
-					'Content-Type': 'text/html; charset=UTF-8',
-				},
-			});
-		} else if ((userAgent && userAgent.includes('mozilla')) || hubParams.some(param => url.pathname.includes(param))) {
-			if (url.pathname == '/') {
-				if (env.URL302) {
-					return Response.redirect(env.URL302, 302);
-				} else if (env.URL) {
-					if (env.URL.toLowerCase() == 'nginx') {
-						//首页改成一个nginx伪装页
-						return new Response(await nginx(), {
-							headers: {
-								'Content-Type': 'text/html; charset=UTF-8',
-							},
-						});
-					} else return fetch(new Request(env.URL, request));
-				} else	{
-					if (fakePage) return new Response(await searchInterface(), {
-						headers: {
-							'Content-Type': 'text/html; charset=UTF-8',
-						},
-					});
-				}
-			} else {
-				// 新增逻辑：/v1/ 路径特殊处理
-				if (url.pathname.startsWith('/v1/')) {
-					url.hostname = 'index.docker.io';
-				} else if (fakePage) {
-					url.hostname = 'hub.docker.com';
-				}
-				if (url.searchParams.get('q')?.includes('library/') && url.searchParams.get('q') != 'library/') {
-					const search = url.searchParams.get('q');
-					url.searchParams.set('q', search.replace('library/', ''));
-				}
-				const newRequest = new Request(url, request);
-				return fetch(newRequest);
-			}
-		}
-
-		// 修改包含 %2F 和 %3A 的请求
-		if (!/%2F/.test(url.search) && /%3A/.test(url.toString())) {
-			let modifiedUrl = url.toString().replace(/%3A(?=.*?&)/, '%3Alibrary%2F');
-			url = new URL(modifiedUrl);
-			console.log(`handle_url: ${url}`);
-		}
-
-		// 处理token请求
-		if (url.pathname.includes('/token')) {
-			let token_parameter = {
-				headers: {
-					'Host': 'auth.docker.io',
-					'User-Agent': getReqHeader("User-Agent"),
-					'Accept': getReqHeader("Accept"),
-					'Accept-Language': getReqHeader("Accept-Language"),
-					'Accept-Encoding': getReqHeader("Accept-Encoding"),
-					'Connection': 'keep-alive',
-					'Cache-Control': 'max-age=0'
-				}
-			};
-			let token_url = auth_url + url.pathname + url.search;
-			return fetch(new Request(token_url, request), token_parameter);
-		}
-
-		// 修改 /v2/ 请求路径
-		if (hub_host == 'registry-1.docker.io' && /^\/v2\/[^/]+\/[^/]+\/[^/]+$/.test(url.pathname) && !/^\/v2\/library/.test(url.pathname)) {
-			//url.pathname = url.pathname.replace(/\/v2\//, '/v2/library/');
-			url.pathname = '/v2/library/' + url.pathname.split('/v2/')[1];
-			console.log(`modified_url: ${url.pathname}`);
-		}
-
-		// 新增：/v2/、/manifests/、/blobs/、/tags/ 先获取token再请求
-		if (
-			url.pathname.startsWith('/v2/') &&
-			(
-				url.pathname.includes('/manifests/') ||
-				url.pathname.includes('/blobs/') ||
-				url.pathname.includes('/tags/')
-				|| url.pathname.endsWith('/tags/list')
-			)
-		) {
-			// 提取镜像名
-			let repo = '';
-			const v2Match = url.pathname.match(/^\/v2\/(.+?)(?:\/(manifests|blobs|tags)\/)/);
-			if (v2Match) {
-				repo = v2Match[1];
-			}
-			if (repo) {
-				const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
-				const tokenRes = await fetch(tokenUrl, {
-					headers: {
-						'User-Agent': getReqHeader("User-Agent"),
-						'Accept': getReqHeader("Accept"),
-						'Accept-Language': getReqHeader("Accept-Language"),
-						'Accept-Encoding': getReqHeader("Accept-Encoding"),
-						'Connection': 'keep-alive',
-						'Cache-Control': 'max-age=0'
-					}
-				});
-				const tokenData = await tokenRes.json();
-				const token = tokenData.token;
-				let parameter = {
-					headers: {
-						'Host': hub_host,
-						'User-Agent': getReqHeader("User-Agent"),
-						'Accept': getReqHeader("Accept"),
-						'Accept-Language': getReqHeader("Accept-Language"),
-						'Accept-Encoding': getReqHeader("Accept-Encoding"),
-						'Connection': 'keep-alive',
-						'Cache-Control': 'max-age=0',
-						'Authorization': `Bearer ${token}`
-					},
-					cacheTtl: 3600
-				};
-				if (request.headers.has("X-Amz-Content-Sha256")) {
-					parameter.headers['X-Amz-Content-Sha256'] = getReqHeader("X-Amz-Content-Sha256");
-				}
-				let original_response = await fetch(new Request(url, request), parameter);
-				let original_response_clone = original_response.clone();
-				let original_text = original_response_clone.body;
-				let response_headers = original_response.headers;
-				let new_response_headers = new Headers(response_headers);
-				let status = original_response.status;
-				if (new_response_headers.get("Www-Authenticate")) {
-					let auth = new_response_headers.get("Www-Authenticate");
-					let re = new RegExp(auth_url, 'g');
-					new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
-				}
-				if (new_response_headers.get("Location")) {
-					const location = new_response_headers.get("Location");
-					console.info(`Found redirection location, redirecting to ${location}`);
-					return httpHandler(request, location, hub_host);
-				}
-				let response = new Response(original_text, {
-					status,
-					headers: new_response_headers
-				});
-				return response;
-			}
-		}
-
-		// 构造请求参数
-		let parameter = {
-			headers: {
-				'Host': hub_host,
-				'User-Agent': getReqHeader("User-Agent"),
-				'Accept': getReqHeader("Accept"),
-				'Accept-Language': getReqHeader("Accept-Language"),
-				'Accept-Encoding': getReqHeader("Accept-Encoding"),
-				'Connection': 'keep-alive',
-				'Cache-Control': 'max-age=0'
-			},
-			cacheTtl: 3600 // 缓存时间
-		};
-
-		// 添加Authorization头
-		if (request.headers.has("Authorization")) {
-			parameter.headers.Authorization = getReqHeader("Authorization");
-		}
-
-		// 添加可能存在字段X-Amz-Content-Sha256
-		if (request.headers.has("X-Amz-Content-Sha256")) {
-			parameter.headers['X-Amz-Content-Sha256'] = getReqHeader("X-Amz-Content-Sha256");
-		}
-
-		// 发起请求并处理响应
-		let original_response = await fetch(new Request(url, request), parameter);
-		let original_response_clone = original_response.clone();
-		let original_text = original_response_clone.body;
-		let response_headers = original_response.headers;
-		let new_response_headers = new Headers(response_headers);
-		let status = original_response.status;
-
-		// 修改 Www-Authenticate 头
-		if (new_response_headers.get("Www-Authenticate")) {
-			let auth = new_response_headers.get("Www-Authenticate");
-			let re = new RegExp(auth_url, 'g');
-			new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
-		}
-
-		// 处理重定向
-		if (new_response_headers.get("Location")) {
-			const location = new_response_headers.get("Location");
-			console.info(`Found redirection location, redirecting to ${location}`);
-			return httpHandler(request, location, hub_host);
-		}
-
-		// 返回修改后的响应
-		let response = new Response(original_text, {
-			status,
-			headers: new_response_headers
-		});
-		return response;
-	}
+    async fetch(request, env = {}) {
+        if (request.headers.has('X-Docker-Proxy-Hop')) return reject('Recursive proxy request', 508);
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+            return reject('This mirror supports pulls only; push directly to your registry', 405, { Allow: 'GET, HEAD, OPTIONS' });
+        }
+        if (request.body || (request.headers.has('Content-Length') && request.headers.get('Content-Length') !== '0') || request.headers.has('Transfer-Encoding')) {
+            return reject('Request bodies are not supported', 400);
+        }
+        if (request.url.length > MAX_URL_LENGTH) return reject('Request URL too long', 414);
+        const url = new URL(request.url);
+        const originHost = url.hostname;
+        const registry = registryFor(url);
+        if (!registry) return reject('Unsupported registry', 400);
+        if (!admit(request)) return reject('Too many requests', 429, { 'Retry-After': '60' });
+        if (request.method === 'OPTIONS') {
+            return new Response(null, { status: 204, headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+                'Access-Control-Allow-Headers': 'Authorization, Accept, Range, If-Range, If-None-Match, If-Modified-Since',
+                'Access-Control-Max-Age': '600',
+            } });
+        }
+        // Routing parameters belong to this proxy, not the upstream API.
+        url.searchParams.delete('ns');
+        url.searchParams.delete('hubhost');
+        let targetRegistry = registry;
+        if (url.pathname === '/') {
+            const blockedAgents = ['netcraft', ...(env.UA ? env.UA.split(/[\s,]+/).filter(Boolean) : [])];
+            const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+            if (env.URL302) return Response.redirect(env.URL302, 302);
+            // Remote homepage fetches are disabled so configuration cannot introduce a self-fetch.
+            if (env.URL && env.URL.toLowerCase() !== 'nginx') return reject('Remote homepage proxy disabled', 503);
+            const html = env.URL || blockedAgents.some(agent => ua.includes(agent.toLowerCase())) ? await nginx() : await searchInterface();
+            return new Response(request.method === 'HEAD' ? null : html, { headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+        }
+        if (url.pathname === '/token') {
+            if (registry !== DEFAULT_REGISTRY ||
+                url.searchParams.getAll('service').some(service => service !== 'registry.docker.io') ||
+                url.searchParams.getAll('scope').some(scope => !/^repository:[a-z0-9._/-]+:pull$/.test(scope))) {
+                return reject('Only Docker Hub pull tokens are supported', 400);
+            }
+            url.searchParams.set('service', 'registry.docker.io');
+            targetRegistry = new URL(AUTH_ORIGIN).hostname;
+        } else if (registry === DEFAULT_REGISTRY && (url.pathname === '/search' || /^\/v2\/repositories\//.test(url.pathname))) {
+            targetRegistry = 'hub.docker.com';
+        } else if (url.pathname.startsWith('/v2/')) {
+            if (/(?:^|\/)uploads(?:\/|$)/.test(url.pathname)) return reject('Uploads are not supported', 405, { Allow: 'GET, HEAD, OPTIONS' });
+            // Direct shorthand /v2/nginx/manifests/latest => Docker's library/nginx.
+            if (registry === DEFAULT_REGISTRY && /^\/v2\/[^/]+\/(?:manifests|blobs|tags)\//.test(url.pathname)) {
+                url.pathname = '/v2/library/' + url.pathname.slice('/v2/'.length);
+            }
+        } else if (registry === DEFAULT_REGISTRY && /^\/v1\/(?:search|repositories)(?:\/|$)/.test(url.pathname)) {
+            targetRegistry = 'index.docker.io';
+            const q = url.searchParams.get('q');
+            if (q?.startsWith('library/') && q !== 'library/') url.searchParams.set('q', q.slice('library/'.length));
+        } else {
+            return reject('Unsupported proxy path', 404);
+        }
+        url.protocol = 'https:';
+        url.hostname = targetRegistry;
+        url.port = '';
+        const response = await upstream(request, url, targetRegistry, originHost);
+        const headers = new Headers(response.headers);
+        const challenge = headers.get('Www-Authenticate');
+        if (registry === DEFAULT_REGISTRY && challenge) {
+            headers.set('Www-Authenticate', challenge.replace('realm="' + AUTH_ORIGIN + '/token"', 'realm="https://' + originHost + '/token"'));
+        }
+        headers.set('Access-Control-Allow-Origin', '*');
+        headers.set('Access-Control-Expose-Headers', '*');
+        // Credentials and tokens must never become shared cache entries.
+        if (request.headers.has('Authorization') || url.pathname === '/token') headers.set('Cache-Control', 'private, no-store');
+        return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers });
+    },
 };
-
-/**
- * 处理HTTP请求
- * @param {Request} req 请求对象
- * @param {string} pathname 请求路径
- * @param {string} baseHost 基地址
- */
-function httpHandler(req, pathname, baseHost) {
-	const reqHdrRaw = req.headers;
-
-	// 处理预检请求
-	if (req.method === 'OPTIONS' &&
-		reqHdrRaw.has('access-control-request-headers')
-	) {
-		return new Response(null, PREFLIGHT_INIT);
-	}
-
-	let rawLen = '';
-
-	const reqHdrNew = new Headers(reqHdrRaw);
-
-	reqHdrNew.delete("Authorization"); // 修复s3错误
-
-	const refer = reqHdrNew.get('referer');
-
-	let urlStr = pathname;
-
-	const urlObj = newUrl(urlStr, 'https://' + baseHost);
-
-	/** @type {RequestInit} */
-	const reqInit = {
-		method: req.method,
-		headers: reqHdrNew,
-		redirect: 'follow',
-		body: req.body
-	};
-	return proxy(urlObj, reqInit, rawLen);
-}
-
-/**
- * 代理请求
- * @param {URL} urlObj URL对象
- * @param {RequestInit} reqInit 请求初始化对象
- * @param {string} rawLen 原始长度
- */
-async function proxy(urlObj, reqInit, rawLen) {
-	const res = await fetch(urlObj.href, reqInit);
-	const resHdrOld = res.headers;
-	const resHdrNew = new Headers(resHdrOld);
-
-	// 验证长度
-	if (rawLen) {
-		const newLen = resHdrOld.get('content-length') || '';
-		const badLen = (rawLen !== newLen);
-
-		if (badLen) {
-			return makeRes(res.body, 400, {
-				'--error': `bad len: ${newLen}, except: ${rawLen}`,
-				'access-control-expose-headers': '--error',
-			});
-		}
-	}
-	const status = res.status;
-	resHdrNew.set('access-control-expose-headers', '*');
-	resHdrNew.set('access-control-allow-origin', '*');
-	resHdrNew.set('Cache-Control', 'max-age=1500');
-
-	// 删除不必要的头
-	resHdrNew.delete('content-security-policy');
-	resHdrNew.delete('content-security-policy-report-only');
-	resHdrNew.delete('clear-site-data');
-
-	return new Response(res.body, {
-		status,
-		headers: resHdrNew
-	});
-}
-
-async function ADD(envadd) {
-	var addtext = envadd.replace(/[	 |"'\r\n]+/g, ',').replace(/,+/g, ',');	// 将空格、双引号、单引号和换行符替换为逗号
-	if (addtext.charAt(0) == ',') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == ',') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split(',');
-	return add;
-}
